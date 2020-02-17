@@ -1,0 +1,170 @@
+---
+title: "Gene_Expression_Preprocessing"
+output: html_document
+---
+
+```{r}
+
+library(tidyverse)
+library(limma)
+library(lumiHumanAll.db)
+library(DBI)
+library(illuminaHumanv4.db)
+library(lumi)
+library(TxDb.Hsapiens.UCSC.hg19.knownGene)
+
+```
+
+```{r}
+
+for (cell in c("T", "B")) {
+  
+  #Define the path to a directory in which to save the normalised data, probe annotation and adjusted data.
+  
+  output_path_expr          <- paste0("~/Normalised_Expression_Data/",cell,"_Cell/Expr_",cell,"_Cell.csv")
+  
+  output_path_pheno_expr    <- paste0("~/Normalised_Expression_Data/",cell,"_Cell/Pheno_Expr_",cell,"_Cell.csv")
+  
+  output_path_adjusted_expr <- paste0("~/Adjusted_Data_SVA/",cell,"_Cell/adjusted_expr_",cell,".csv")
+  
+  output_path_anno_probe    <- paste0("~/Normalised_Expression_Data/",cell,"_Cell/anno_probe_",cell,".csv")
+  
+  #Read in the phenotype table for gene expression data
+  
+  pheno_expr <- read_tsv(paste0("Pheno_",cell,"_Expression.txt")) %>% 
+                as.data.frame %>% 
+                dplyr::select(EA_Num, Sentrix, Conversion_Batch, iScan_Batch, Scanning_Batch)
+  
+  #Define the path to the expression IDAT files
+  
+  idatfiles  <- pheno_expr$Sentrix %>% paste0("~/Expression_IDATs/",.,"_Grn.idat")
+  
+  #Read in the annotation file
+  
+  bgxfile               <- "./HumanHT-12_V4_0_R2_15002873_B.bgx"
+  
+  #Read in the raw data IDAT files
+  
+  x_raw                 <- read.idat(idatfiles, bgxfile)
+  
+  #Calculate detection p-values
+  
+  x_raw$other$Detection <- detectionPValues(x_raw)
+  
+  # Remove probes with detection p-value >0.05 in >25% of samples 
+
+  det_pval_fail               <- x_raw$other$Detection > 0.05
+  
+  det_pval_remove             <- names(which(rowMeans(det_pval_fail)>0.25, TRUE))
+  
+  det_pval_filtered           <- x_raw$other$Detection %>%
+                                 .[! (rownames(.) %in% det_pval_remove),] %>%
+                                 as.data.frame
+  
+  rownames(det_pval_filtered) <- substr(rownames(det_pval_filtered),2,nchar(rownames(det_pval_filtered)))
+  
+  colnames(det_pval_filtered) <- pheno_expr$EA_Num
+  
+  #remove samples for which average sample p-value < 0.05 followinf the removal of failed probes
+
+  keep       <- colMeans(det_pval_filtered) < 0.05
+  
+  x_raw      <- x_raw[,keep]
+  
+  pheno_expr <- pheno_expr[keep,]
+  
+  #Quantile Normalization of raw expression data
+
+  norm_data             <- neqc(x_raw)
+  
+  exp_set               <- norm_data$E[-c(na.omit(match(det_pval_remove, rownames(norm_data)))),]
+  
+  colnames(exp_set)     <- colnames(exp_set) %>%
+                           gsub("~/Expression_IDATs/","",.) %>%
+                           gsub("_Grn","",.)
+  
+  #Get expression probe annotation then filter out bad probes and those mapping to sex chromosomes
+  
+  anno_probe            <- illuminaHumanv4fullReannotation() %>%
+                           as.data.frame %>% 
+                           dplyr::slice(match(rownames(exp_set),ArrayAddress)) %>% 
+                           filter(! ProbeQuality == "Bad") %>% 
+                           filter(! ProbeQuality == "No match") %>%
+                           filter(! grepl("chrX|chrY", GenomicLocation))
+
+  exp_set_f             <- exp_set[c(na.omit(match(anno_probe$ArrayAddress, rownames(exp_set)))),]
+  
+  rownames(exp_set_f)   <- anno_probe$IlluminaID
+  colnames(exp_set_f)   <- pheno_expr$EA_Num
+  
+  #As for the DNA methylation data, technical/biological confounders are estimates by
+  #surrogate variable analysis
+  
+  pheno_meth            <- read_csv(paste0("~/MatrixEQTL_Input_Data/",cell,"_Cell/","Pheno_",cell,"_Cell.csv")) %>% 
+                           dplyr::select(EA_Num, Diagnosis_code)
+  
+  pheno_expr            <- pheno_expr %>% 
+                           #ensure expression data and DNAm data are paired
+                           filter(EA_Num %in% pheno_meth$EA_Num) %>% 
+                           #join with DNAm phenotype file to get Diagnosis_code information
+                           left_join(pheno_meth)
+  
+  exp_set_f             <- exp_set_f[,pheno_expr$EA_Num]
+  
+  #Define the full model. We want to preserve any effects due to sample type (i.e. disease diagnosis)
+  
+  mod       <- model.matrix(~Diagnosis_code, data = pheno_expr)
+  
+  #Define the null model
+  
+  mod0      <- model.matrix(~1, data = pheno_expr)
+  
+  #Estimate the number of SVs
+  
+  n_sv_exp  <- num.sv(exp_set_f, mod, method="be")
+  
+  #Estimate the SVs
+  
+  svobj_exp               <- sva(exp_set_f, mod, mod0,
+                                 n.sv = n_sv_exp)
+  
+  surrogate_variables_exp <- svobj_exp$sv %>% 
+                             as.data.frame %>% 
+                             mutate(EA_Num = pheno_expr$EA_Num) %>% 
+                             left_join(pheno_expr[,c("EA_Num","Diagnosis_code")], by="EA_Num") %>% 
+                             column_to_rownames(var="EA_Num")
+  
+  #Adjust data for SVs for the purpose of plotting
+  
+  design                <- model.matrix(~0 + as.factor(Diagnosis_code),
+                                        data = surrogate_variables_exp)
+  
+  cov                   <- surrogate_variables_exp %>%
+                           dplyr::select(V1:paste0("V",n_sv_exp)) %>%
+                           as.matrix
+  
+  adjusted_data_exp     <- removeBatchEffect(exp_set_f,
+                                             covariates = cov,
+                                             design = design) %>% 
+                           as.data.frame
+  
+  #write gene expression phenotype table to a file
+  
+  write.csv(pheno_expr, file = output_path_pheno_expr)
+  
+  #write normalised expression data to a file
+  
+  write.csv(exp_set_f, file = output_path_expr)
+  
+  #write probe annotation to file
+  
+  write.csv(anno_probe, file = output_path_anno_probe)
+  
+  #write adjusted expression data to file
+  
+  write.csv(adjusted_data_exp, file = output_path_adjusted_expr)
+  
+}
+```
+
+

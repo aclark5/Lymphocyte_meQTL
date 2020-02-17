@@ -1,0 +1,299 @@
+---
+title: "DNA_Methylation_Preprocessing"
+output: html_document
+---
+
+Load Required Packages
+
+```{r Libraries, include=TRUE}
+library(minfi)
+library(tidyverse)
+library(isva)
+library(sva)
+library(broom)
+library(missMethyl)
+library(reshape2)
+library(limma)
+library(lumi)
+```
+
+Data for CD4+ T cells and B cells were read in and normalised seperately. The objects 'multimappers', 'crossreact', and 'epic_cr' contain CG identifiers for CpG sites determined to be cross-reactive or multimapping based on the following publications:
+
+- Benton MC, Johnstone A, Eccles D, Harmon B, Hayes MT, Lea RA, et al. An analysis of DNA methylation in human adipose tissue reveals differential modification of obesity genes before and after gastric bypass and weight loss. Genome Biol. 2015;16:21.
+- Chen YA, Lemire M, Choufani S, Butcher DT, Grafodatskaya D, Zanke BW, et al. Discovery of cross-reactive probes and polymorphic CpGs in the Illumina Infinium HumanMethylation450 microarray. Epigenetics. 2013;8(2):203-9.
+- Pidsley R, Zotenko E, Peters TJ, Lawrence MG, Risbridger GP, Molloy P, et al. Critical evaluation of the Illumina MethylationEPIC BeadChip microarray for whole-genome DNA methylation profiling. Genome Biol. 2016;17:17.
+- McCartney DL, Walker RM, Morris SW, McIntosh AM, Porteous DJ, Evans KL. Identification of polymorphic and off-target probe binding sites on the Illumina Infinium MethylationEPIC BeadChip. Genomics Data 2016; 9:22-4.
+
+Required data as input are IDAT files from the Illumina MethylationEPIC array located in ("~/850K_IDAT/") as well as the master phenotype table describing the data, and the above tables of multimapping/cross-reactive probes. Raw data, Normalised data (generated using the below script), and sample phenotype information are available at the Gene Expression Omnibus (accession numbers: GSE137634)
+
+```{r}
+#read in files containing CG identifiers for cross-reactive and multimapping CpG probes on the Illumina MethylationEPIC array.
+
+multimappers         <- read_tsv("HumanMethylation450_hg19_bowtie_multimap.txt",
+                                 col_types=cols(), col_names = F) %>% 
+                        .$X1 %>%
+                        unique
+
+crossreact           <- read_csv("crossreact-probes-Illumina450k.csv",
+                                 col_types=cols()) %>%
+                        .$TargetID %>%
+                        unique
+
+epic_cr              <- read_csv("13059_2016_1066_MOESM1_ESM.csv",
+                                 col_types=cols()) %>%
+                        .$CpG %>%
+                        unique
+
+mccartney_cr         <- read_csv("McCartney_cross_hybridizing.csv") %>%
+                        .$CpG %>% 
+                        unique
+
+#Define cross-reactive probes to remove
+
+cpg_remove_mmcr     <- c(multimappers,crossreact,epic_cr,mccartney_cr) %>%
+                       unique
+
+rm(multimappers ,crossreact, epic_cr, mccartney_cr)
+
+```
+
+Preprocessing of CD4+ T cell and B cell data
+
+```{r}
+
+for (cell in c("T", "B")) {
+  
+  #Define the path to a directory in which to save the normalised data, annotations, and covariates file.
+  
+  output_path_pheno          <- paste0("~/MatrixEQTL_Input_Data/",cell,"_Cell/","Pheno_",cell,"_Cell.csv")
+  output_path_mval           <- paste0("~/MatrixEQTL_Input_Data/",cell,"_Cell/","Mvals_",cell,"_Cell.csv")
+  output_path_covariates     <- paste0("~/MatrixEQTL_Input_Data/",cell,"_Cell/","Covariates_",cell,"_Cell.csv")
+  output_path_meth_anno      <- paste0("~/MatrixEQTL_Input_Data/",cell,"_Cell/","Meth_Annotation_",cell,"_Cell.csv")
+  
+  output_path_adjusted_mvals <- paste0("~/Adjusted_Data_SVA/",cell,"_Cell/adjusted_mvals_",cell,".csv")
+  
+  #List the unique Sentrix identifier for each sample on the array
+  
+  raw_idat <- list.files("850K_IDAT/") %>%
+              gsub("_Red.idat","",.) %>%
+              gsub("_Grn.idat","",.) %>% unique
+  
+  #Read in the phenotype table containing information on sample processing and patient data
+  
+  pheno_in <- read_tsv("Pheno_Master_Methylation.txt") %>%
+              as.data.frame %>% 
+              arrange(EA_Num) %>% 
+    
+  #Removed samples that failed quality control checks (i.e. genotype checks, PCA) or were identified 
+  #to be potential samples mix-ups based on the estimateCellCounts function in minfi. Technical 
+  #repliocate samples are also removed. Conversion batch 2 contains a plate that was erroneously
+  #read twice and thus contains replicated data - the correct data readings for these cells are
+  #contained within Conversion Batch 6. Array 201247490053 returned errors when scanning the array 
+  #and as such has been excluded here
+    
+              filter(Conversion_Batch != 2, 
+                     QC != "Bad",
+                     Replicate_Type != "Tech",
+                     CellMix != "Problem", 
+                     !(grepl("201247490053", Sentrix_ID))) %>% 
+              mutate(Basename = paste0("850K_IDAT/",Sentrix_ID)) %>%
+    
+  #Create unique identifiers within the phenotype table to identify the corresponding array and position on
+  #the array for each sample.
+    
+              mutate(Array_ID = paste0(substr(Sentrix_ID, 1,12))) %>%
+              mutate(Position_ID = paste0(substr(Sentrix_ID, 14,19))) %>%
+              reshape::rename(c("PtAge@Visit"="Age")) %>% 
+              reshape::rename(c("Gender" = "Sex")) %>% 
+              
+    
+  #Create a variable - 'SampleType' - that described the patient diagnosis (RA/non-RA) as well as the cell type 
+  #(T/B cell).
+    
+              mutate(SampleType = "",
+              SampleType = ifelse(grepl("RA",Diagnosis_Code_1), "RA",""),
+              SampleType = ifelse(grepl("NRA",Diagnosis_Code_1), "NRA",SampleType),
+              SampleType = ifelse(grepl("UA_NRA",Diagnosis_Code_1), "NRA",SampleType),
+              SampleType = ifelse(grepl("UA_RA",Diagnosis_Code_1), "RA",SampleType),
+              SampleType = paste0(SampleType,"_",Cell_Type)) %>% 
+    
+  #Convert phenotypic/clinical information to a numeric variable for modelling
+    
+              mutate(Sex_code = "", Sex_code = ifelse(grepl("M",Sex), 0,1)) %>% 
+              mutate(Smoking_code = "", Smoking_code = ifelse(grepl("N",Smoking), 0,1)) %>% 
+              mutate(Position_code = substr(Position_ID,3,3)) %>% 
+              mutate(Diagnosis_code = "", Diagnosis_code = ifelse(grepl("NRA",SampleType), 0,1))
+  
+  #Filter the data table to include samples of one cell type
+  
+  pheno_in <- pheno_in %>%
+              filter(Cell_Type == paste0(cell,"_Cell")) 
+  
+  #Read in the raw data and calculate probe detection p-values
+  
+  raw_data      <- read.metharray.exp(targets = pheno_in,
+                                      force = T, verbose = T)
+  
+  det_pval        <- raw_data %>% detectionP(type = "m+u")
+  
+  #Any probes for which the detection p-value exceeds 0.01 in more than 10% of samples were excluded
+  #from our analysis
+  
+  det_pval_fail   <- det_pval > 0.01
+  
+  det_pval_remove <- names(which(rowMeans(det_pval_fail)>0.1, TRUE))
+  
+  #Following the removal of failed probes, we also excluded samples with an everage detection p-value 
+  #of >0.01 across all probes
+  
+  det_pval_filtered <- det_pval %>%
+                       as.data.frame %>%
+                       filter(! rownames(.) %in% det_pval_remove)
+  
+  keep              <- colMeans(det_pval_filtered) < 0.01
+  
+  raw_data          <- raw_data[,keep]
+  
+  pheno_in          <- pheno_in %>% filter(Sentrix_ID %in% rownames(raw_data@colData))
+  
+  #Random matrix theory to estimate the number of significant components of variation in the data - this is input as
+  #an argument during functional normalisation (see below).
+  
+  raw_INCs <- getINCs(raw_data)
+  
+  RMT      <- EstDimRMT(raw_INCs,plot = T)
+  
+  PC_num   <- RMT$dim
+  
+  #Functional Normalisation
+  
+  set.seed(5)
+  norm_data           <- raw_data %>%
+                         preprocessFunnorm(nPCs = PC_num)
+  
+  #Convert intensities to M-values (log M/(M+U))
+  
+  Mvals <- norm_data %>%
+           getM
+  
+  #Identify probes with Inf values generated during functional normalisation
+  
+  remove_inf          <- (which(abs(Mvals)==Inf, arr.ind=TRUE)[,1])
+  
+  #Remove the above probes as well as off-target/cross-reactive probes
+  remove              <- c(remove_inf,match(unique(c(det_pval_remove,cpg_remove_mmcr)),rownames(norm_data))) %>% 
+                         unique %>%
+                         na.omit
+  
+  if(length(remove) > 0) {
+    norm_data_f       <- norm_data[-remove,]
+  } else {
+    norm_data_f       <- norm_data
+  }
+  
+  #Add SNP data for the probes
+  
+  norm_data_f         <- norm_data_f %>% addSnpInfo
+  
+  probe_num_tmp       <- nrow(norm_data_f)
+  
+  #Remove probes with a SNP (MAF > 0.05) within the single base extension site, the CpG site, or the probe sequence.
+  
+  norm_data_f         <- norm_data_f %>% dropLociWithSnps(., snps = c("SBE","CpG", "Probe"), maf  = 0.05)
+  
+  #Get the Illumina annotation
+  
+  annotation          <- norm_data_f %>% getAnnotation %>% as.data.frame
+
+  #Remove probes mapping to the sex chromsomes
+  
+  norm_data_f         <- norm_data_f[-grep("chrX|chrY", annotation$chr),]
+
+  annotation          <- norm_data_f %>% getAnnotation %>% as.data.frame
+
+  #Create an annotation file for all CpGs to pass to MatrixEQTL
+  
+  annotation_qtl      <- annotation %>% dplyr::select(Name,chr,pos) %>%
+                         mutate(end = paste0(pos)) %>%
+                         magrittr::set_colnames(c("CpG","CHR","Start","End"))
+  
+  #Obtain Beta values and M values for the filtered data
+  
+  Mvals               <- norm_data_f %>% getM
+
+  #Whilst we have information on batch processing, we cannot be sure of all sources of technical variability,
+  #so it is best to estimate this from the data itself
+  
+  colnames(Mvals) <- c(pheno_in$EA_Num)
+  
+  #Calculate SVs using standard SVA
+  #Define the full model. We want to preserve any effects due to sample type (i.e. disease diagnosis)
+  
+  mod   <- model.matrix(~Diagnosis_code, data = pheno_in)
+  
+  #Define the null model
+  
+  mod0  <- model.matrix(~1, data = pheno_in)
+  
+  #Estimate the number of SVs
+  
+  n_sv  <- num.sv(Mvals, mod, method="be")
+  
+  #Estimate the SVs
+  
+  svobj <- sva(Mvals, mod, mod0, n.sv = n_sv)
+
+  surrogate_variables <- svobj$sv %>% 
+                         as.data.frame %>% 
+                         mutate(EA_Num = pheno_in$EA_Num) %>% 
+                         left_join(pheno_in[,c("EA_Num","Diagnosis_code")], by="EA_Num") %>% 
+                         column_to_rownames(var="EA_Num")
+  
+  #Prepare a covariates file to pass to MatrixEQTL
+  
+  Covariates <- surrogate_variables %>% 
+                t %>% 
+                as.data.frame %>% rownames_to_column("ID")
+  
+  #Adjust data for SVs for the purpose of plotting
+  
+  Mvals                 <- Mvals %>%
+                           as.matrix
+  
+  design                <- model.matrix(~0 + as.factor(Diagnosis_code), data = surrogate_variables)
+  
+  cov                   <- surrogate_variables %>%
+                           dplyr::select(V1:paste0("V",n_sv)) %>%
+                           as.matrix
+  
+  adjusted_data         <- removeBatchEffect(Mvals,
+                                             covariates = cov,
+                                             design = design) %>% 
+                           as.data.frame
+  
+  #Write the adjusted data to file
+  
+  write.csv(adjusted_data, file = paste0(output_path_adjusted_mvals))
+  
+  #Convert M-values into correct format to pass to MatrixEQTL
+  Mvals      <- Mvals %>%
+                as.data.frame %>%
+                rownames_to_column(var="CpG")
+  
+  #Write MatrixEQTL input data to file
+  
+  write.csv(annotation_qtl, file = paste0(output_path_meth_anno))
+  write.csv(Mvals,file = paste0(output_path_mval))
+  write.csv(Covariates,file = paste0(output_path_covariates))
+  write.csv(pheno_in, file = paste0(output_path_pheno))
+  
+}
+
+
+```
+
+
+
+
+
+

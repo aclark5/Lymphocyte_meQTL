@@ -1,0 +1,212 @@
+---
+title: "Causal_Inference_Testing"
+output: html_document
+---
+
+```{r}
+
+library(tidyverse)
+library(cit)
+
+```
+
+Prepare input data for causal inference testing (CIT)
+
+```{r}
+
+for(cell in c("T","B")) {
+  
+  for(trait in c("RA","MS","Asthma","OA")) {
+    
+    #Read in file of all SNP coordinates at risk loci
+    
+    Risk_loci <- read_csv(paste0("~/GWAS_Risk_SNPs/",trait,"_LD_SNPs.csv"))
+    
+    #Read in the significant eQTM results and create a data frame of CpG-Gene pairs
+    
+    CpG_Gene              <- read_csv(paste0("~eQTM_Result/",cell,"_Cell/eQTM_sig_",trait,"_",cell,"_Cell.csv")) %>% 
+                             dplyr::select(CpG, IlluminaID)
+    
+    #Create a data frame of all triplets at the risk loci by merging meQTL and eQTM results
+    
+    risk_meQTL_annotation <- read_csv(paste0("~/Results_mQTL/",cell,"_Cell/Cis_results_",
+                                             cell,"_Cell_clumped.csv")) %>%
+                             #Create a column of SNP locations to match with risk variants
+                             mutate(Coord = paste0(Coord = paste0(SNP_Chr,":",SNP_Pos))) %>% 
+                             filter(Coord %in% Risk_loci$Coord) %>% 
+                             dplyr::select(SNP,CpG) %>% 
+                             left_join(CpG_Gene,by="CpG") %>%
+                             filter(! is.na(IlluminaID))
+
+    #Read in the genotype data
+    
+    Genotypes             <- read_csv(paste0("~/MatrixEQTL_Input_Data/",cell,"_Cell/Genotypes_",
+                                             cell,"_Cell.csv")) %>% 
+                             filter(SNP %in% risk_meQTL_annotation$SNP)
+    
+    #Create a vector of all sample IDs for which paired genotype, DNA methylation
+    #and gene expression data are available
+    
+    samples_geno          <- colnames(Genotypes[2:ncol(Genotypes)])
+    
+    samples_expr          <- read_csv(paste0("~/Normalised_Expression_Data/",cell,"_Cell/Pheno_Expr_",
+                                              cell,"_Cell.csv")) %>% 
+                             .[["EA_Num"]]
+    
+    samples_meth          <- read_csv(paste0("~/MatrixEQTL_Input_Data/",cell,"_Cell/","Pheno_",
+                                             cell,"_Cell.csv")) %>% 
+                             .[["EA_Num"]]
+    
+    samples_geno_meth_exp <- intersect(intersect(samples_geno,samples_meth), samples_expr)
+    
+    #Filter genotype data 
+    
+    genotypes_cit         <- Genotypes[,c("SNP",samples_geno_meth_exp)] %>% 
+                             column_to_rownames("SNP") %>% 
+                             t %>% 
+                             rownames_to_column("EA_Num") %>% 
+                             arrange(EA_Num)
+    
+    #Read in DNA methylation data and filter
+    
+    meth_cit              <- read_csv(paste0("~/Residuals/Residuals_",cell,"_Mvals.csv")) %>% 
+                             magrittr::set_colnames(.,c("CpG",colnames(.)[2:ncol(.)])) %>% 
+                             filter(CpG %in% risk_meQTL_annotation$CpG) %>% 
+                             column_to_rownames("CpG") %>% 
+                             dplyr::select(samples_geno_meth_exp)
+                             t %>% 
+                             rownames_to_column("EA_Num") %>% 
+                             arrange(EA_Num)
+                             
+    #Read in gene expression data and filter
+
+    expr_cit              <- read_csv(paste0("~/Residuals/Residuals_",cell,"_Expr.csv")) %>% 
+                             magrittr::set_colnames(.,c("IlluminaID",colnames(.)[2:ncol(.)])) %>% 
+                             filter(IlluminaID %in% risk_meQTL_annotation$Gene) %>% 
+                             column_to_rownames("IlluminaID") %>% 
+                             dplyr::select(samples_geno_meth_exp)
+                             t %>% 
+                             rownames_to_column("EA_Num") %>% 
+                             arrange(EA_Num)
+      
+     #Confirm that all samples are matching in each dataset
+                                                                            
+     if(!all(sapply(list(genotypes_cit$EA_Num,meth_cit$EA_Num), FUN = identical, expr_cit$EA_Num))) {
+       
+       stop("sample IDs do not match in all datasets")
+       
+     }
+     
+     #write the SNP-CpG-Gene triplet annotation to file                             
+    
+     write.csv(risk_meQTL_annotation, paste0("~/CIT_Input/",cell,"_Cell/",trait,"/",cell,
+                                             "_Cell_",trait,"_SNP_CpG_Gene_CIT.csv"))
+     
+     #write the CIT genotype input data to file
+     
+     write.csv(genotypes_cit, paste0("~/CIT_Input/",cell,"_Cell/",trait,"/",cell,
+                                             "_Cell_",trait,"_genotypes_cit.csv"))
+     
+     #write the CIT DNA methylation input data to file
+     
+     write.csv(meth_cit, paste0("~/CIT_Input/",cell,"_Cell/",trait,"/",cell,
+                                             "_Cell_",trait,"_meth_cit.csv"))
+     
+     #write the CIT gene expression input data to file
+     
+     write.csv(expr_cit, paste0("~/CIT_Input/",cell,"_Cell/",trait,"/",cell,
+                                             "_Cell_",trait,"_expr_cit.csv"))
+  }
+}
+
+```
+
+Perform the CIT analysis for both cell types and all traits. 
+
+```{r}
+
+for(cell in c("T", "B")) {
+  
+  anno_probe <- paste0("~/Normalised_Expression_Data/",cell,"_Cell/anno_probe_",cell,".csv") %>% 
+                dplyr::select(IlluminaID, SymbolReannotated)
+  
+  for(trait in c("RA","MS","Asthma","OA")) {
+    
+    #Read in the triplet (SNP, CpG, Gene) annotation to include in CIT
+    
+    snps_cpgs_genes <- read_csv(paste0("~/CIT_Input/",cell,"_Cell/",trait,"/",cell,
+                                             "_Cell_",trait,"_SNP_CpG_Gene_CIT.csv")) %>% 
+                       as.data.frame %>% 
+                       dplyr::select(SNP, CpG, IlluminaID)
+    
+    #Read in the genotype data
+    
+    genotypes_cit   <- read_csv(paste0("~/CIT_Input/",cell,"_Cell/",trait,"/",cell,
+                                             "_Cell_",trait,"_genotypes_cit.csv")) %>% 
+                       as.data.frame %>% 
+                       dplyr::select(-X1) %>% 
+                       column_to_rownames("EA_Num")
+    
+    #Read in the DNA methylation data
+    
+    meth_cit        <- read_csv(paste0("~/CIT_Input/",cell,"_Cell/",trait,"/",cell,
+                                             "_Cell_",trait,"_meth_cit.csv")) %>% 
+                       as.data.frame %>% 
+                       dplyr::select(-X1) %>% 
+                       column_to_rownames("EA_Num")
+    
+    #Read in the gene expression data
+    
+    expr_cit        <- read_csv(paste0("~/CIT_Input/",cell,"_Cell/",trait,"/",cell,
+                                             "_Cell_",trait,"_expr_cit.csv")) %>% 
+                       as.data.frame %>% 
+                       dplyr::select(-X1) %>% 
+                       column_to_rownames("EA_Num")
+    
+    #Remove any duplicate triplets
+    snps_cpgs_genes = snps_cpgs_genes %>% unique
+    
+    #Ensure all triplets are present in the input data
+    snps_cpgs_genes = snps_cpgs_genes[snps_cpgs_genes$SNP %in% colnames(genotypes_cit),]
+    snps_cpgs_genes = snps_cpgs_genes[snps_cpgs_genes$CpG %in% colnames(meth_cit),]
+    snps_cpgs_genes = snps_cpgs_genes[snps_cpgs_genes$IlluminaID %in% colnames(expr_cit),]
+    
+    cit_result = NULL
+    
+    #Perform CIT for each triplet - 1000 permutations are performed to later calculate false discovery rate (FDR)
+    
+    for (i in c(1:nrow(snps_cpgs_genes))) {
+      
+      snp = snps_cpgs_genes[i,"SNP"]
+      gene = snps_cpgs_genes[i,"IlluminaID"]
+      cpg = snps_cpgs_genes[i,"CpG"]
+      
+      L = genotypes_cit[[snp]]
+      G = meth_cit[[cpg]]
+      T = exp_cit[[gene]]
+      
+      cit_result[[i]] = cit.cp(L,G,T,n.perm=1000,rseed=10)      
+      
+    }
+    
+    #Calculate FDR-corrected CIT values
+    
+    cit_fdr         <- fdr.cit(cit_result, cl=.95, c1=NA)
+
+    snps_cpgs_genes <- snps_cpgs_genes %>% mutate(Test_num = c(1:nrow(snps_cpgs_genes)))
+    cit_fdr         <- cit_fdr %>% mutate(Test_num = c(1:nrow(cit_fdr)))
+    cit_fdr         <- merge(snps_cpgs_genes,cit_fdr,by="Test_num")
+    
+    #Merge with gene names for each IlluminaID
+    
+    cit_fdr         <- cit_fdr %>% left_join(anno_probe, by="IlluminaID")
+    
+    #Write the CIT results to file
+    
+    write.csv(cit_fdr, paste0("~/Cit_Results/",cell,"_Cell/",trait,"/",cell,
+                              "_Cell_",trait,"_cit_fdr.csv"))
+    
+  }
+}
+```
+

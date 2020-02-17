@@ -1,0 +1,97 @@
+---
+title: "Get_Residuals_for_CIT"
+output: html_document
+---
+
+```{r}
+
+library(tidyverse)
+library(magrittr)
+library(sva)
+library(limma)
+
+```
+
+The code below requires five csv files to run: T cell Methylation (T_Mvals.csv), B cell Methylation (B_Mvals.csv), T cell Expression (T_Expr.csv), B cell expression (B_Expr.csv) as well as the phenotype file (Pheno.csv).
+
+Columns are sample ID (format = EAXXXX) and rows are probe IDs (cgXXXXXXXX for Meth, ILMN_XXXXXXX for Expr)
+
+```{r}
+
+for(cell in c("T", "B")) {
+  
+  for(type in c("Mvals", "Expr")) {
+    
+    #Read in the dataset
+    
+    dataset  = readr::read_csv(paste0(type,"_",cell,"_Cell.csv")) %>% 
+               dplyr::column_to_rownames("X1") %>% 
+               as.matrix()
+    
+    #Read in the phenotype table and filter out rows not in the dataset (for the Mvals no
+    #samples should be filtered out, for Expr datasets a few rows will be filtered)
+    
+    pheno    = readr::read_csv(paste0("Pheno_",cell,"_Cell.csv")) %>% 
+               dplyr::select("EA_Num","Diagnosis_code") %>% 
+               dplyr::filter(EA_Num %in% colnames(dataset))
+    
+    #Define the full and null models for surrogate variable analysis (SVA). Any effects
+    #relating to the patient diagnosis (RA (1) or non-RA (0)) are conserved as these were
+    #passed seperately as covariates to the meQTL models - this allowed for potential
+    #interaction effects to be explored
+    
+    mod     = stats::model.matrix(~Diagnosis_code, data = pheno)
+    mod0    = stats::model.matrix(~1, data = pheno)
+    
+    #Calculate surrogate variables
+    
+    svobj               = sva::sva(dataset, mod, mod0)
+    
+    #Save a object with the number of SVs
+    
+    num_sv              = ncol(svobj$sv)
+    
+    #extract the SV values from the sv object and merge with the diagnosis info from
+    #the phenotype table
+    
+    surrogate_variables = svobj$sv %>% 
+                          as.data.frame %>% 
+                          dplyr::mutate(EA_Num = pheno$EA_Num) %>% 
+                          dplyr::left_join(pheno, by="EA_Num")
+    
+    #Create a vector of all SVs to pass to the design matrix
+    
+    sv_vector           = paste0("V",seq(1,num_sv,by=1),
+                                 collapse = " + ")
+    
+    #Define the formula to pass to the design matrix
+    
+    design_formula      = as.formula(paste("~Diagnosis_code + ",sv_vector))
+    
+    #Create the design matrix
+      
+    design              = stats::model.matrix(design_formula,
+                                              data = surrogate_variables)
+    
+    #fit a linear model to the dataset, specifying the design matrix
+    
+    fit_lm              = limma::lmFit(dataset, design)
+    
+    #extract the model residuals
+    
+    residuals           = limma::residuals.MArrayLM(fit_lm, dataset)
+    
+    #save the residuals to the directory as a csv file
+    
+    write_csv(residuals %>% as.data.frame(),
+              path = paste0("~/Residuals/Residuals_",cell,"_",type,".csv"))
+    
+  }
+}
+```
+
+
+
+
+
+

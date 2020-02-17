@@ -1,0 +1,272 @@
+---
+title: "eQTM_Analysis"
+output: html_document
+---
+
+```{r}
+
+library(tidyverse)
+library(biomaRt)
+library(GenomicRanges)
+library(reshape2)
+library(broom)
+library(cit)
+
+```
+
+Create functions
+
+```{r}
+
+#Function to test for association between methylation residuals and expression residuals for all genes within 500kb of the meQTL-associated CpG sites
+
+qtm = function(x, y){
+  test     = cor.test(x, y, method = "spearman",exact = F)
+  cor_pval = test$p.value
+  cor_rho  = test$estimate
+  result   = c(cor_pval,cor_rho)
+  names(result) = c("cor_pval","cor_rho")
+  return(result)
+}
+
+#function to create a data frame containing the genes within 500kb for each CpG site
+
+tss2range = function(x,dfc,dfg){
+  Chr = dfg[x,"Chr"]; TSS = dfg[x,"transcription_start_site"]
+  which(dfc$CpG_Chr == Chr & dfc$Lower<TSS & TSS<dfc$Upper) %>% dfc[.,] %>% rownames()
+}
+
+```
+
+Perform Expression Quantitative Trait Methylation (eQTM) association tests in both cell types and across
+cis-CpGs at all risk loci (rheumatoid arthritis, multiple sclerosis, asthma, osteoarthritis)
+
+```{r}
+
+for(cell in c("T", "B")) {
+  
+  #Read in the phenotype table for gene expression data
+  
+  pheno_expr <- read_csv(paste0("~/Normalised_Expression_Data/",cell,"_Cell/Pheno_Expr_",cell,"_Cell.csv")) %>% 
+                dplyr::select(-X1)
+  
+  #Read in gene expression residuals
+  
+  expression <- read_csv(paste0("~/Residuals/Residuals_",cell,"_Expr.csv")) %>% 
+                column_to_rownames(X1)
+  
+  #Read in expression probe annotation
+  
+  anno_probe <- read_csv(paste0("~/Normalised_Expression_Data/",cell,"_Cell/anno_probe_",cell,".csv")) %>% 
+                dplyr::select(-X1)
+  
+  #Ensure all expression probes are contained in the annotation file
+  
+  if(!all(rownames(expression)==anno_probe$IlluminaID)) {
+    
+    stop("Row names of expression dataset do not match probe annotations")
+    
+  }
+  
+  #Read in the phenotype table for the DNA methylation data
+  
+  pheno_meth <- read_csv(paste0("~/MatrixEQTL_Input_Data/",cell,"_Cell/","Pheno_",cell,"_Cell.csv")) %>% 
+                dplyr::select(-X1)
+  
+  #Read in the DNA methylation data
+  
+  meth       <- read_csv(paste0("~/Residuals/Residuals_",cell,"_Mvals.csv")) %>% 
+                column_to_rownames(X1)
+  
+  #Read in the clumped cis-meQTL results and merge with the CpG annotation
+  
+  meQTL_annotation <- read_csv(paste0("~/Results_mQTL/",cell,"_Cell/Cis_results_",cell,"_Cell_clumped.csv")) %>% 
+                      dplyr::select(-X1) %>% 
+                      #Create a column of SNP locations to match with risk variants
+                      mutate(Coord = paste0(Coord = paste0(SNP_Chr,":",SNP_Pos))) %>% 
+                      #Define the upper and lower bounds +/- 500Kb of cis-CpGs
+                      mutate("Lower" = (CpG_Pos - 500000)) %>%
+                      mutate("Upper" = (CpG_Pos + 500000)) %>% 
+                      #Remove the "chr" prefix from chromosome number
+                      mutate(CpG_Chr = as.numeric(paste0(substr(CpG_Chr,4,nchar(CpG_Chr)))))
+  
+  #download transcription start site coordinates for genes in data set
+
+  mart                  <- useMart(biomart="ENSEMBL_MART_ENSEMBL",
+                           host="grch37.ensembl.org",
+                           dataset = "hsapiens_gene_ensembl")
+
+  TSS_annotation        <- getBM(attributes = c("ensembl_gene_id",
+                                                "start_position",
+                                                "transcript_start",
+                                                "transcription_start_site",
+                                                "strand","external_gene_name",
+                                                "illumina_humanht_12_v4"),
+                                 mart=mart) %>%
+                           filter(illumina_humanht_12_v4 %in% anno_probe$IlluminaID) %>%
+                           dplyr::rename(Gene = external_gene_name,
+                                         IlluminaID = illumina_humanht_12_v4) %>%
+                           left_join(anno_probe[,c("IlluminaID","GenomicLocation")]) %>%   
+                           separate(.,GenomicLocation,into=c("Chr","Pos"),sep=":") %>%
+                           mutate(Chr = as.numeric(substr(Chr,4,nchar(Chr)))) %>% 
+                           mutate(transcription_start_site = as.numeric(transcription_start_site))
+
+  
+  for(trait in c("RA","MS","Asthma","OA")) {
+    
+    #Define the path to directories to save the eQTM inout datasets
+    
+    CpG_gene_ranges_output  <- paste0("~eQTM_Input/",cell,"_Cell/CpG_Gene_Ranges_",trait,"_",cell,"_Cell.csv")
+    
+    Genes_in_regions_output <- paste0("~eQTM_Input/",cell,"_Cell/Genes_within_500kb_",trait,"_",cell,"_Cell.csv")
+    
+    #Read in file containing risk SNPs in each LD block at trait risk loci
+    
+    Risk_loci               <- read_csv(paste0("~/GWAS_Risk_SNPs/",trait,"_LD_SNPs.csv"))
+    
+    #Filter the meQTL annotation to include only cis-meQTLs mapping to risk loci defined above
+    
+    risk_QTL_annotation     <- meQTL_annotation %>% filter(Coord %in% Risk_loci$Coord)
+    
+    #Identify genes with a transcription start site within the CpG ranges
+    
+    gr1   <- GRanges(Rle(risk_QTL_annotation$CpG_Chr),
+                     IRanges(risk_QTL_annotation$Lower, risk_QTL_annotation$Upper,
+                             names = risk_QTL_annotation$CpG))
+
+    gr2   <- GRanges(Rle(TSS_annotation$Chr),
+                     IRanges(TSS_annotation$transcription_start_site, TSS_annotation$transcription_start_site,
+                             names = TSS_annotation$IlluminaID))
+  
+    grOut  <- subsetByOverlaps(gr2,gr1)
+    
+    overlap <- grOut@ranges@NAMES %>% as.vector %>% unique
+    
+    #Filter the annotation to include only those genes in the CpG ranges
+
+    TSS_annotation_keep    <- TSS_annotation %>% filter(IlluminaID %in% overlap)
+    
+    #Write the risk meQTL annotation and gene ranges to file
+    
+    write.csv(risk_QTL_annotation,CpG_Gene_Ranges_output)
+    
+    write.csv(TSS_annotation_keep, Genes_in_regions_output)
+    
+    
+    
+    cpg             <- risk_QTL_annotation %>%
+                       dplyr::select(-SNP) %>%
+                       remove_rownames() %>% 
+                       column_to_rownames("CpG")
+               
+    gene            <- TSS_Annotation_keep %>% 
+                       as.data.frame %>%
+                       remove_rownames %>%
+                       column_to_rownames("IlluminaID")
+    
+    
+    
+    CpGs_Gene_Range       <- sapply(rownames(gene),tss2range, dfc = cpg, dfg = gene) %>%
+                             melt %>%
+                             left_join(gene %>% rownames_to_column(),
+                                       by = c("L1" = "rowname")) %>%
+                             left_join(cpg %>% rownames_to_column(),
+                                       by = c("value" = "rowname")) %>%
+                             dplyr::select(value, L1) %>%
+                             group_by(value) %>%
+                             mutate(Gene = dense_rank(L1)) %>%
+                             ungroup %>%
+                             spread(Gene, L1) %>% 
+                             magrittr::set_colnames(., c("CpG", paste0("Gene", 1:(ncol(.)-1))))
+    
+    Gene_expression_mqtl  <- expression %>%
+                             as.data.frame %>%
+                             rownames_to_column("IlluminaID") %>%
+                             filter(IlluminaID %in% TSS_annotation_keep$IlluminaID) %>%
+                             column_to_rownames("IlluminaID") %>% 
+                             t %>%
+                             as.data.frame %>%
+                             rownames_to_column %>%
+                             magrittr::set_colnames(.,c("EA_Num", colnames(.)[2:ncol(.)])) %>%
+                             filter(EA_Num %in% pheno_meth$EA_Num)
+    
+    Mvals_risk_mQTL       <- Mvals %>%
+                             as.data.frame %>%
+                             rownames_to_column("CpG") %>% 
+                             filter(CpG %in% unique(CpGs_Gene_Range$CpG)) %>%
+                             column_to_rownames("CpG") %>% 
+                             t %>%
+                             as.data.frame %>%
+                             rownames_to_column %>%
+                             magrittr::set_colnames(.,c("EA_Num", colnames(.)[2:ncol(.)])) %>%
+                             filter(EA_Num %in% pheno_meth$EA_Num)
+    
+    cpgs.genes <- CpGs_Gene_Range %>% 
+                  remove_rownames %>% 
+                  column_to_rownames(var="CpG")
+    
+    exp        <- Gene_expression_mqtl %>%
+                  arrange(EA_Num) %>%
+                  as.data.frame
+  
+    meth       <- Mvals_risk_mQTL %>%
+                  arrange(EA_Num) %>%
+                  as.data.frame
+    
+    result     <- NULL
+    my_list    <- list()
+    
+    for(cpg in rownames(cpgs.genes)){
+      
+      #CpG related Genes
+
+      genes <- cpgs.genes[cpg,] %>%
+               as.character %>%
+               na.omit %>%
+               as.vector %>%
+               lapply(.,grep, x=names(exp)) %>%
+               unlist %>% names(exp)[.]
+      
+      exp.genes = dplyr::select(exp, one_of(genes))
+
+      #Perform correlation tests
+      
+      y = meth[,cpg] %>%
+          as.vector
+      
+      result[[cpg]] = sig = apply(exp.genes, 2, qtm, y = y) %>%
+                            t %>%
+                            as.data.frame %>%
+                            rownames_to_column %>%
+                            #Perform Benjamini-Hochberg adjustment of p-values
+                            mutate(cor_BHpval = p.adjust(cor_pval,method = "BH"),
+                                   CpG = paste0(rep(cpg))) %>%
+                            filter(cor_BHpval < 0.01)
+      
+       colnames(result[[cpg]])[1] = "IlluminaID"
+    
+       #Combine eQTM results across all CpGs into a data frame
+       
+       qtm_result <- do.call(rbind.data.frame, result) %>%
+                     as.data.frame %>%
+                     remove_rownames %>%
+                     #Get gene names for IlluminaIDs from the probe annotation
+                     left_join(anno_probe[,c("IlluminaID","SymbolReannotated")]) %>% 
+                     mutate(eQTM = paste0(CpG,"_",SymbolReannotated)) %>% 
+                     arrange(cor_BHpval)
+       
+       #write eQTM results to file
+       
+       write.csv(qtm_result,paste0("~eQTM_Result/",cell,"_Cell/eQTM_sig_",trait,"_",cell,"_Cell.csv"))
+    
+    }
+    
+  }
+  
+}
+
+```
+
+
+
+
