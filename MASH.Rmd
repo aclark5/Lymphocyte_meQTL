@@ -1,0 +1,47 @@
+---
+title: "Multivariate Adaptive Shrinkage: JACI paper Figure 2 B"
+---
+
+```{r}
+library(tidyverse); library(ashr); library(mashr); library(VennDiagram); library(limma)
+set.seed(123)
+
+# Read in a matrix of effects (Bhat) and a matrix of standard errors (Shat) corresponding to two subsets of the results of the comparative analysis:
+load("strong.RData") # a subset of “strong” tests (significant tests).
+load("random.RData") # a random subset of all tests.
+
+# Estimate the correlation structure in the null tests from the random data.
+Vhat = estimate_null_correlation_simple(random)
+
+# Set up strong and random data with the correlation structure.
+random = mash_set_data(random$Bhat, random$Shat, V=Vhat) 
+strong = mash_set_data(strong$Bhat, strong$Shat, V=Vhat) 
+
+# Use the strong tests to set up data-driven covariances
+U.ed = cov_pca(strong, 2) %>% cov_ed(strong, .)
+
+# Use the random tests to set up canonical covariances
+U.c = cov_canonical(random)
+
+# Fit mash model to the random tests using both data-driven and canonical covariances
+m = mash(random, Ulist = c(U.ed,U.c), outputlevel = 1) 
+
+# Compute posterior summaries for the strong tests using the above mash fit.
+m = mash(strong, g=get_fitted_g(m), fixg=TRUE) 
+
+# Extract measures of significance (local false sign rates)
+lfsr = get_lfsr(m) %>% as.data.frame() %>% rownames_to_column("QTL") %>%
+  mutate(SNP = strsplit2(QTL,split = "_")[,1], CpG = strsplit2(QTL,split = "_")[,2])
+head(lfsr); dim(lfsr)
+
+# Figure E2 B: Overlap of cis-meQTL CpGs between CD4+ T cells and B cells identified
+# using a multivariate adaptive shrinkage analysis (MASH) approach.
+x = list(B.cell = filter(lfsr, beta.B < 0.05) %>% .$CpG %>% unique(),
+         T.cell = filter(lfsr, beta.T < 0.05) %>% .$CpG %>% unique())
+venn.diagram(x, filename = "FigureE2B.tiff", fill = c("#ffe666","#99e6ff"), cat.cex = 2,
+             cat.fontface = "bold",cat.dist=0.05, print.mode = c("raw","percent"),
+             cat.pos = c(-20,20), fontface = "bold", cex = 1, euler.d=FALSE, scaled = FALSE,
+             force.unique=TRUE, imagetype = "tiff", fontfamily = "serif",
+             cat.fontfamily = "serif", cat.col = c("white","white"), resolution = 1000)
+
+```

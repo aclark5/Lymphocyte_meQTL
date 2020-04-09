@@ -1,0 +1,46 @@
+---
+title: "Bayesian co-localisation analysis: JACI paper Supplementary Table 6"
+---
+
+```{r}
+rm(list = ls())
+
+library(tidyverse); library(coloc)
+
+mqtl.coloc = function(cpg,       # Potential RA risk-associated cis mQTL CpG
+                      cell,
+                      snps.cpg,  # summary data of SNP-CpG associations from mQTL analysis
+                      snps.disease # summary data of SNP-disease risk associations from GWAS
+){
+  
+  # mQTL dataset
+  #if(nrow(locus.mqtls) != 0){}
+  snps.cpg = filter(snps.cpg, gene == cpg) %>%
+    list(N = ifelse(cell == "B",119,103), beta = .$beta, varbeta = .$varBeta,
+         type = "quant", sdY = unique(.$SD), snp = .$snps); length(snps.cpg$snp)
+  
+  # GWAS variants 
+  snps.disease = filter(snps.disease, SNP %in% snps.cpg$snp) %>%
+    list(N = 58284, beta = .$Beta, varbeta = .$varBeta, type = "cc",
+         s = 0.24639695, snp = .$SNP); length(snps.disease$snp)
+  
+  res = coloc.abf(dataset1 = snps.cpg, dataset2 = snps.disease) %>% .$summary %>%
+    c(., .["PP.H4.abf"]/.["PP.H3.abf"]) %>% .[6:7]
+  names(res) = c("PP4", "PP4/PP3")
+  res
+}
+
+# Calculate colocalisation posterior probabilities for potential RA risk-associated cis mQTLs
+mqtls = readRDS("mqtls.rds")
+for(cell in c("T","B")){
+  load(paste0(cell,".RData")); ls()
+  mqtls = sapply(cpgs, mqtl.coloc, cell, snps.cpg, snps.disease) %>%
+    t %>% as.data.frame %>% rownames_to_column("CpG") %>%
+    mutate(PP4 = format.pval(PP4, digits = 2, eps=0.749, scientific = FALSE),
+           "PP4/PP3" = format.pval(`PP4/PP3`, digits = 0, eps=5, scientific = FALSE)) %>%
+    left_join(mqtls, . , by = c("CpGs.associated.w.LD.block" = "CpG"))
+}
+colnames(mqtls) = gsub("x","T.cell",colnames(mqtls)) %>% gsub("y","B.cell",.)
+write.csv(mqtls,"supplementary_table_6.csv")
+
+```
