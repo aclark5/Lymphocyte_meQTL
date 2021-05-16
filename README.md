@@ -6,6 +6,6 @@ Preprocessing of DNA methylation data generated using the Illunina Infinium Meth
 Surrogate variable analysis is performed to identify latent sources of variation, and these combined into a table with disease diagnosis to use as covariates in meQTL mapping. Methylation data are adjusted for covariates for plotting purposes. 
 The outputs are DNA methylation M-values (as well as data adjusted for covariates), an annotation file detailing genomic mappings for all CpGs passing QC, a table of covariates, and the sample annotation file.
 
--meQTL_run_all.R
+- meQTL_run_all.R
 This script runs the main engine for mapping meQTLs in T and B cells seperately using MatrixEQTL (Shabalin PMID 22492648). This is submitted to a cluster using the shell script mQTL_cluster.sh.
 
