@@ -9,3 +9,8 @@ The outputs are DNA methylation M-values (as well as data adjusted for covariate
 - meQTL_run_all.R
 This script runs the main engine for mapping meQTLs in T and B cells seperately using MatrixEQTL (Shabalin PMID 22492648). This is submitted to a cluster using the shell script mQTL_cluster.sh.
 
+- Get_Residuals.Rmd
+Calculation of DNAm and expression residuals that were inputted to the causal inference test (CIT) and the eQTM analysis. 
+
+- CIT.Rmd
+Prepares input data and performs the CIT analysis for both cell types and all traits. 
